@@ -147,6 +147,7 @@ class RewardManager(ManagerBase):
                 continue
             # compute term's value
             value = term_cfg.func(self._env, **term_cfg.params) * term_cfg.weight * dt
+            value = torch.nan_to_num(value, nan=0.0, posinf=0.0, neginf=0.0)
             # update total reward
             self._reward_buf += value
             # update episodic sum
@@ -155,7 +156,7 @@ class RewardManager(ManagerBase):
             # Update current reward for this step.
             self._step_reward[:, term_idx] = value / dt
 
-        return self._reward_buf
+        return torch.nan_to_num(self._reward_buf, nan=0.0, posinf=0.0, neginf=0.0)
 
     """
     Operations - Term settings.

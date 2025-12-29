@@ -1,0 +1,439 @@
+diff --git a/source/isaaclab/isaaclab/envs/manager_based_rl_env.py b/source/isaaclab/isaaclab/envs/manager_based_rl_env.py
+index c29d203b07..3b11c4925b 100644
+--- a/source/isaaclab/isaaclab/envs/manager_based_rl_env.py
++++ b/source/isaaclab/isaaclab/envs/manager_based_rl_env.py
+@@ -7,10 +7,14 @@
+ from __future__ import annotations
+ 
+ import gymnasium as gym
++import json
+ import math
+ import numpy as np
++import os
++import time
+ import torch
+ from collections.abc import Sequence
++from pathlib import Path
+ from typing import Any, ClassVar
+ 
+ from isaacsim.core.version import get_version
+@@ -74,6 +78,23 @@ class ManagerBasedRLEnv(ManagerBasedEnv, gym.Env):
+         """
+         # -- counter for curriculum
+         self.common_step_counter = 0
++        # -- invalid state monitor
++        self._invalid_state_log_path = Path("logs/rsl_rl/sim_state_monitor_logs.jsonl")
++        self._invalid_state_event_counter = 0
++        # -- periodic diagnostics
++        self._state_diagnostics_log_path = Path("logs/rsl_rl/state_diagnostics_logs.jsonl")
++        self._state_diagnostics_event_counter = 0
++        self._state_diagnostics_interval = 2048
++        self._state_diagnostics_height_threshold = 1.5
++        # -- reward monitor placeholder (mirrors vecenv wrapper path)
++        self._reward_monitor_log_path = Path("logs/rsl_rl/reward_monitor_logs.jsonl")
++        # -- sanitization budget monitoring
++        self._sanitization_counter = 0
++        self._sanitization_window_start = 0
++        self._sanitization_limit = int(os.environ.get("ISAACLAB_SANITIZATION_LIMIT", cfg.scene.num_envs))
++        san_window_env = os.environ.get("ISAACLAB_SANITIZATION_WINDOW")
++        self._sanitization_window = int(san_window_env) if san_window_env is not None else None
++        self._sanitization_warning_emitted = False
+ 
+         # initialize the episode length buffer BEFORE loading the managers to use it in mdp functions.
+         self.episode_length_buf = torch.zeros(cfg.scene.num_envs, device=cfg.sim.device, dtype=torch.long)
+@@ -82,6 +103,9 @@ class ManagerBasedRLEnv(ManagerBasedEnv, gym.Env):
+         super().__init__(cfg=cfg)
+         # store the render mode
+         self.render_mode = render_mode
++        if self._sanitization_window is None:
++            window_default = max(1, math.ceil(self.cfg.episode_length_s / self.step_dt))
++            self._sanitization_window = window_default
+ 
+         # initialize data and constants
+         # -- set the framerate of the gym video recorder wrapper so that the playback speed of the produced video matches the simulation
+@@ -196,6 +220,10 @@ class ManagerBasedRLEnv(ManagerBasedEnv, gym.Env):
+             # update buffers at sim dt
+             self.scene.update(dt=self.physics_dt)
+ 
++        # sanitize articulated state before using it for rewards/terminations
++        sanitized = self._sanitize_articulation_state()
++        self._record_state_diagnostics(reason="sanitization" if sanitized else None, force=sanitized)
++
+         # post-step:
+         # -- update env counters (used for curriculum generation)
+         self.episode_length_buf += 1  # step in current episode (per env)
+@@ -394,3 +422,244 @@ class ManagerBasedRLEnv(ManagerBasedEnv, gym.Env):
+ 
+         # reset the episode length buffer
+         self.episode_length_buf[env_ids] = 0
++
++    def _sanitize_articulation_state(self) -> bool:
++        """Detect NaN/Inf states in the main articulation, replace them with safe values, and log diagnostics."""
++        try:
++            robot = self.scene["robot"]
++        except KeyError:
++            return False
++        num_envs = robot.data.root_pos_w.shape[0]
++        device = robot.data.root_pos_w.device
++        invalid_mask = torch.zeros(num_envs, dtype=torch.bool, device=device)
++        tensors_to_check = [
++            robot.data.root_pos_w,
++            robot.data.root_quat_w,
++            robot.data.root_lin_vel_w,
++            robot.data.root_ang_vel_w,
++            getattr(robot.data, "joint_pos", None),
++            getattr(robot.data, "joint_vel", None),
++            getattr(robot.data, "joint_acc", None),
++            getattr(robot.data, "body_pos_w", None),
++            getattr(robot.data, "body_quat_w", None),
++        ]
++        def _reduce_env(mask_tensor: torch.Tensor) -> torch.Tensor:
++            if mask_tensor.dim() <= 1:
++                return mask_tensor
++            dims = tuple(range(1, mask_tensor.dim()))
++            return mask_tensor.any(dim=dims)
++
++        for tensor in tensors_to_check:
++            if tensor is None:
++                continue
++            nan_mask = torch.isnan(tensor)
++            inf_mask = torch.isinf(tensor)
++            nan_mask = _reduce_env(nan_mask)
++            inf_mask = _reduce_env(inf_mask)
++            invalid_mask |= nan_mask
++            invalid_mask |= inf_mask
++        invalid_any = torch.any(invalid_mask)
++        # sanitize all tracked tensors in-place
++        tensors_to_sanitize = [
++            robot.data.root_pos_w,
++            robot.data.root_quat_w,
++            robot.data.root_lin_vel_w,
++            robot.data.root_ang_vel_w,
++            getattr(robot.data, "joint_pos", None),
++            getattr(robot.data, "joint_vel", None),
++            getattr(robot.data, "joint_acc", None),
++            getattr(robot.data, "applied_torque", None),
++            getattr(robot.data, "body_pos_w", None),
++            getattr(robot.data, "body_quat_w", None),
++        ]
++        for tensor in tensors_to_sanitize:
++            if tensor is None:
++                continue
++            torch.nan_to_num_(tensor, nan=0.0, posinf=0.0, neginf=0.0)
++        if not invalid_any:
++            return False
++        env_ids = torch.nonzero(invalid_mask, as_tuple=False).squeeze(-1)
++        timestamp = time.time()
++        self._invalid_state_event_counter += 1
++        if env_ids.numel() == 0:
++            return False
++        env_count = env_ids.shape[0]
++        sample_count = min(4, env_count)
++        sample_ids_tensor = env_ids[:sample_count].detach().cpu()
++        log_entry: dict[str, Any] = {
++            "timestamp": timestamp,
++            "timestamp_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(timestamp)),
++            "event_index": self._invalid_state_event_counter,
++            "common_step": int(self.common_step_counter),
++            "env_ids": env_ids.detach().cpu().tolist(),
++            "sample_env_ids": sample_ids_tensor.tolist(),
++            "action": "nan_sanitized",
++        }
++        with torch.no_grad():
++            try:
++                commands_tensor = self.command_manager.get_command("base_velocity").detach().cpu()
++            except Exception:
++                commands_tensor = None
++            if commands_tensor is not None:
++                log_entry["command_sample"] = commands_tensor[sample_ids_tensor].tolist()
++            default_root_pos = getattr(self.cfg.scene.robot.init_state, "pos", (0.0, 0.0, 0.6))
++            if default_root_pos is None:
++                default_root_pos = (0.0, 0.0, 0.6)
++            if not isinstance(default_root_pos, torch.Tensor):
++                default_root_pos = torch.tensor(default_root_pos, dtype=robot.data.root_pos_w.dtype, device=device)
++            default_root_pos = default_root_pos.unsqueeze(0).expand(env_count, -1)
++            env_count = env_ids.shape[0]
++            identity = torch.zeros((env_count, 4), dtype=robot.data.root_quat_w.dtype, device=device)
++            identity[:, 3] = 1.0
++            robot.data.root_pos_w[env_ids] = default_root_pos
++            robot.data.root_quat_w[env_ids] = identity
++            robot.data.root_lin_vel_w[env_ids] = 0.0
++            robot.data.root_ang_vel_w[env_ids] = 0.0
++            if getattr(robot.data, "joint_pos", None) is not None and hasattr(robot.data, "default_joint_pos"):
++                default_joint = robot.data.default_joint_pos
++                if default_joint.dim() == 1:
++                    default_joint = default_joint.unsqueeze(0)
++                default_joint = default_joint.expand(env_count, -1)
++                robot.data.joint_pos[env_ids] = default_joint
++            if getattr(robot.data, "joint_vel", None) is not None:
++                robot.data.joint_vel[env_ids] = 0.0
++            if getattr(robot.data, "joint_acc", None) is not None:
++                robot.data.joint_acc[env_ids] = 0.0
++            if getattr(robot.data, "body_pos_w", None) is not None:
++                robot.data.body_pos_w[env_ids] = 0.0
++            if getattr(robot.data, "body_quat_w", None) is not None:
++                body_identity = torch.zeros_like(robot.data.body_quat_w[env_ids])
++                body_identity[..., 3] = 1.0
++                robot.data.body_quat_w[env_ids] = body_identity
++            log_entry["root_pos_sample"] = robot.data.root_pos_w[sample_ids_tensor].detach().cpu().tolist()
++            log_entry["root_quat_sample"] = robot.data.root_quat_w[sample_ids_tensor].detach().cpu().tolist()
++            log_entry["root_lin_vel_sample"] = robot.data.root_lin_vel_w[sample_ids_tensor].detach().cpu().tolist()
++            log_entry["root_ang_vel_sample"] = robot.data.root_ang_vel_w[sample_ids_tensor].detach().cpu().tolist()
++            if getattr(robot.data, "joint_pos", None) is not None:
++                log_entry["joint_pos_sample"] = robot.data.joint_pos[sample_ids_tensor].detach().cpu().tolist()
++            if getattr(robot.data, "joint_vel", None) is not None:
++                log_entry["joint_vel_sample"] = robot.data.joint_vel[sample_ids_tensor].detach().cpu().tolist()
++        self._invalid_state_log_path.parent.mkdir(parents=True, exist_ok=True)
++        with open(self._invalid_state_log_path, "a", encoding="utf-8") as f:
++            f.write(json.dumps(log_entry) + "\n")
++        printable_ids = ", ".join(map(str, log_entry["sample_env_ids"]))
++        print(
++            "[State Monitor] Sanitized invalid articulation state "
++            f"(event #{self._invalid_state_event_counter}) in envs [{printable_ids}] "
++            f"at step {self.common_step_counter}. Logged to {self._invalid_state_log_path}."
++        )
++        self._log_reward_monitor_placeholder(
++            reason="sanitization", robot=robot, env_ids=env_ids, sample_ids=sample_ids_tensor
++        )
++        self._update_sanitization_budget(env_count)
++        return True
++
++    def _record_state_diagnostics(self, reason: str | None = None, force: bool = False):
++        """Log aggregated state information periodically or when triggered."""
++        try:
++            robot = self.scene["robot"]
++        except KeyError:
++            return
++        if not force:
++            if self.common_step_counter % self._state_diagnostics_interval != 0:
++                # trigger if root height exceeds threshold
++                root_height = robot.data.root_pos_w[:, 2]
++                if torch.max(root_height).item() < self._state_diagnostics_height_threshold:
++                    return
++                reason = reason or "height_threshold"
++        timestamp = time.time()
++        self._state_diagnostics_event_counter += 1
++        entry: dict[str, Any] = {
++            "timestamp": timestamp,
++            "timestamp_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(timestamp)),
++            "event_index": self._state_diagnostics_event_counter,
++            "common_step": int(self.common_step_counter),
++            "reason": reason or "interval",
++        }
++        with torch.no_grad():
++            root_pos = robot.data.root_pos_w[:, 2]
++            entry["root_height"] = {
++                "min": float(torch.min(root_pos).item()),
++                "max": float(torch.max(root_pos).item()),
++                "mean": float(torch.mean(root_pos).item()),
++            }
++            torques = torch.abs(getattr(robot.data, "applied_torque", torch.empty(0)))
++            if torques.numel() > 0:
++                entry["joint_torque"] = {
++                    "max": float(torch.max(torques).item()),
++                    "mean": float(torch.mean(torques).item()),
++                }
++            contact_sensor = getattr(self.scene, "contact_forces", None)
++            if contact_sensor is not None and hasattr(contact_sensor.data, "net_forces_w"):
++                forces = torch.linalg.norm(contact_sensor.data.net_forces_w, dim=-1)
++                entry["contact_force_norm"] = {
++                    "max": float(torch.max(forces).item()),
++                    "mean": float(torch.mean(forces).item()),
++                }
++        self._state_diagnostics_log_path.parent.mkdir(parents=True, exist_ok=True)
++        with open(self._state_diagnostics_log_path, "a", encoding="utf-8") as f:
++            f.write(json.dumps(entry) + "\n")
++        if reason:
++            print(
++                "[State Diagnostics] Logged event "
++                f"(#{self._state_diagnostics_event_counter}, {reason}) at step {self.common_step_counter}. "
++                f"Snapshot saved to {self._state_diagnostics_log_path}."
++            )
++
++    def _log_reward_monitor_placeholder(
++        self, reason: str, robot, env_ids: torch.Tensor, sample_ids: torch.Tensor
++    ):
++        """Emit a reward-monitor style log even if the actual reward manager never ran."""
++        try:
++            commands = self.command_manager.get_command("base_velocity").detach().cpu()
++        except Exception:
++            commands = None
++        snapshot = {
++            "timestamp": time.time(),
++            "timestamp_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
++            "event_index": int(self._invalid_state_event_counter),
++            "common_step": int(self.common_step_counter),
++            "reason": f"{reason}_pre_reward",
++            "reward_sample": [],
++            "reward_max": None,
++            "reward_min": None,
++            "reward_mean": None,
++            "env_ids": env_ids.detach().cpu().tolist(),
++            "sample_env_ids": sample_ids.detach().cpu().tolist(),
++        }
++        root_pos = robot.data.root_pos_w[sample_ids].detach().cpu().tolist()
++        snapshot["root_height_sample"] = [pos[2] for pos in root_pos]
++        if commands is not None:
++            snapshot["command_sample"] = commands[sample_ids].tolist()
++        try:
++            base_vel = robot.data.root_lin_vel_b[sample_ids].detach().cpu().tolist()
++            snapshot["base_lin_vel_sample"] = base_vel
++        except Exception:
++            pass
++        self._reward_monitor_log_path.parent.mkdir(parents=True, exist_ok=True)
++        with open(self._reward_monitor_log_path, "a", encoding="utf-8") as f:
++            f.write(json.dumps(snapshot) + "\n")
++
++    def _update_sanitization_budget(self, sanitized_envs: int):
++        """Abort runs where sanitization becomes chronic to save debugging time."""
++        if self._sanitization_limit <= 0 or sanitized_envs <= 0:
++            return
++        window = max(1, self._sanitization_window)
++        if self.common_step_counter - self._sanitization_window_start > window:
++            self._sanitization_window_start = self.common_step_counter
++            self._sanitization_counter = 0
++            self._sanitization_warning_emitted = False
++        self._sanitization_counter += sanitized_envs
++        usage = self._sanitization_counter / max(1, self._sanitization_limit)
++        if usage >= 0.5 and not self._sanitization_warning_emitted:
++            print(
++                "[State Monitor] Warning: sanitization budget usage "
++                f"{usage * 100:.1f}% within the last {window} steps "
++                f"(limit {self._sanitization_limit})."
++            )
++            self._sanitization_warning_emitted = True
++        if self._sanitization_counter > self._sanitization_limit:
++            raise RuntimeError(
++                "Sanitization budget exceeded. Too many environments required NaN recovery recently. "
++                "Inspect logs/rsl_rl/sim_state_monitor_logs.jsonl before resuming training."
++            )
+diff --git a/source/isaaclab/isaaclab/managers/reward_manager.py b/source/isaaclab/isaaclab/managers/reward_manager.py
+index 63077eacc4..e56e3771e8 100644
+--- a/source/isaaclab/isaaclab/managers/reward_manager.py
++++ b/source/isaaclab/isaaclab/managers/reward_manager.py
+@@ -147,6 +147,7 @@ class RewardManager(ManagerBase):
+                 continue
+             # compute term's value
+             value = term_cfg.func(self._env, **term_cfg.params) * term_cfg.weight * dt
++            value = torch.nan_to_num(value, nan=0.0, posinf=0.0, neginf=0.0)
+             # update total reward
+             self._reward_buf += value
+             # update episodic sum
+@@ -155,7 +156,7 @@ class RewardManager(ManagerBase):
+             # Update current reward for this step.
+             self._step_reward[:, term_idx] = value / dt
+ 
+-        return self._reward_buf
++        return torch.nan_to_num(self._reward_buf, nan=0.0, posinf=0.0, neginf=0.0)
+ 
+     """
+     Operations - Term settings.
+diff --git a/source/isaaclab_rl/isaaclab_rl/rsl_rl/vecenv_wrapper.py b/source/isaaclab_rl/isaaclab_rl/rsl_rl/vecenv_wrapper.py
+index d909bf2d91..722d2647cb 100644
+--- a/source/isaaclab_rl/isaaclab_rl/rsl_rl/vecenv_wrapper.py
++++ b/source/isaaclab_rl/isaaclab_rl/rsl_rl/vecenv_wrapper.py
+@@ -5,6 +5,9 @@
+ 
+ import gymnasium as gym
+ import torch
++import time
++import json
++from pathlib import Path
+ 
+ from rsl_rl.env import VecEnv
+ 
+@@ -174,6 +177,94 @@ class RslRlVecEnvWrapper(VecEnv):
+             actions = torch.clamp(actions, -self.clip_actions, self.clip_actions)
+         # record step information
+         obs_dict, rew, terminated, truncated, extras = self.env.step(actions)
++        # monitor rewards for numerical issues
++        with torch.no_grad():
++            reward_nan = torch.isnan(rew).any()
++            reward_inf = torch.isinf(rew).any()
++            reward_large = torch.max(torch.abs(rew)).item() > 1e3
++
++        def _log_snapshot(reason: str):
++            try:
++                robot = self.unwrapped.scene["robot"]
++                heights = robot.data.root_pos_w[:, 2].detach().cpu().numpy()
++                base_vel = robot.data.root_lin_vel_b[:, :3].detach().cpu().numpy()
++            except Exception:
++                heights = None
++                base_vel = None
++                robot = None
++            timestamp = time.time()
++            event_idx = getattr(self, "_reward_monitor_event_counter", 0) + 1
++            self._reward_monitor_event_counter = event_idx
++            common_step = int(getattr(self.unwrapped, "common_step_counter", -1))
++            try:
++                episode_lengths = self.unwrapped.episode_length_buf.detach().cpu().numpy()
++            except Exception:
++                episode_lengths = None
++            snapshot = {
++                "timestamp": timestamp,
++                "timestamp_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(timestamp)),
++                "event_index": event_idx,
++                "common_step": common_step,
++                "reason": reason,
++                "reward_sample": rew.detach().cpu().numpy()[:8].tolist(),
++                "reward_max": float(torch.max(rew).item()),
++                "reward_min": float(torch.min(rew).item()),
++                "reward_mean": float(torch.mean(rew).item()),
++            }
++            if heights is not None:
++                snapshot["root_height_sample"] = heights[:8].tolist()
++            if episode_lengths is not None:
++                snapshot["episode_length_sample"] = episode_lengths[:8].tolist()
++            try:
++                commands = self.unwrapped.command_manager.get_command("base_velocity").detach().cpu().numpy()
++                snapshot["command_sample"] = commands[:8].tolist()
++            except Exception:
++                pass
++            if base_vel is not None:
++                snapshot["base_lin_vel_sample"] = base_vel[:8].tolist()
++            reward_manager = getattr(self.unwrapped, "reward_manager", None)
++            if reward_manager is not None:
++                try:
++                    term_names = list(reward_manager.active_terms)
++                    step_rewards = reward_manager._step_reward.detach().clone().cpu()
++                    # capture per-term magnitudes to understand explosions
++                    snapshot["reward_term_max_abs"] = {
++                        term: float(torch.max(torch.abs(step_rewards[:, idx])).item())
++                        for idx, term in enumerate(term_names)
++                    }
++                    sample_count = min(4, step_rewards.shape[0])
++                    term_samples: list[dict[str, float]] = []
++                    for env_idx in range(sample_count):
++                        term_samples.append(
++                            {
++                                term: float(step_rewards[env_idx, term_idx].item())
++                                for term_idx, term in enumerate(term_names)
++                            }
++                        )
++                    snapshot["reward_term_samples"] = term_samples
++                except Exception:
++                    pass
++            log_path = getattr(
++                self, "_reward_monitor_log_path", Path("logs/rsl_rl/reward_monitor_logs.jsonl")
++            )
++            log_path.parent.mkdir(parents=True, exist_ok=True)
++            with open(log_path, "a", encoding="utf-8") as f:
++                f.write(json.dumps(snapshot) + "\n")
++            printable_ts = snapshot.get("timestamp_iso", f"{timestamp:.3f}")
++            reward_span = (snapshot["reward_min"], snapshot["reward_max"])
++            print(
++                "[Reward Monitor] Logged event "
++                f"(#{event_idx}, {reason}) at step {common_step} ({printable_ts}); "
++                f"reward range [{reward_span[0]:.2f}, {reward_span[1]:.2f}]. "
++                f"Snapshot saved to {log_path}."
++            )
++
++        if reward_large:
++            _log_snapshot("magnitude > 1e3")
++        if reward_nan or reward_inf:
++            reason = "NaN" if reward_nan else "Inf"
++            _log_snapshot(reason)
++            raise RuntimeError("Invalid reward detected (see logs above).")
+         # compute dones for compatibility with RSL-RL
+         dones = (terminated | truncated).to(dtype=torch.long)
+         # move extra observations to the extras dict

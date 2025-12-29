@@ -5,6 +5,9 @@
 
 import gymnasium as gym
 import torch
+import time
+import json
+from pathlib import Path
 
 from rsl_rl.env import VecEnv
 
@@ -174,6 +177,94 @@ class RslRlVecEnvWrapper(VecEnv):
             actions = torch.clamp(actions, -self.clip_actions, self.clip_actions)
         # record step information
         obs_dict, rew, terminated, truncated, extras = self.env.step(actions)
+        # monitor rewards for numerical issues
+        with torch.no_grad():
+            reward_nan = torch.isnan(rew).any()
+            reward_inf = torch.isinf(rew).any()
+            reward_large = torch.max(torch.abs(rew)).item() > 1e3
+
+        def _log_snapshot(reason: str):
+            try:
+                robot = self.unwrapped.scene["robot"]
+                heights = robot.data.root_pos_w[:, 2].detach().cpu().numpy()
+                base_vel = robot.data.root_lin_vel_b[:, :3].detach().cpu().numpy()
+            except Exception:
+                heights = None
+                base_vel = None
+                robot = None
+            timestamp = time.time()
+            event_idx = getattr(self, "_reward_monitor_event_counter", 0) + 1
+            self._reward_monitor_event_counter = event_idx
+            common_step = int(getattr(self.unwrapped, "common_step_counter", -1))
+            try:
+                episode_lengths = self.unwrapped.episode_length_buf.detach().cpu().numpy()
+            except Exception:
+                episode_lengths = None
+            snapshot = {
+                "timestamp": timestamp,
+                "timestamp_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(timestamp)),
+                "event_index": event_idx,
+                "common_step": common_step,
+                "reason": reason,
+                "reward_sample": rew.detach().cpu().numpy()[:8].tolist(),
+                "reward_max": float(torch.max(rew).item()),
+                "reward_min": float(torch.min(rew).item()),
+                "reward_mean": float(torch.mean(rew).item()),
+            }
+            if heights is not None:
+                snapshot["root_height_sample"] = heights[:8].tolist()
+            if episode_lengths is not None:
+                snapshot["episode_length_sample"] = episode_lengths[:8].tolist()
+            try:
+                commands = self.unwrapped.command_manager.get_command("base_velocity").detach().cpu().numpy()
+                snapshot["command_sample"] = commands[:8].tolist()
+            except Exception:
+                pass
+            if base_vel is not None:
+                snapshot["base_lin_vel_sample"] = base_vel[:8].tolist()
+            reward_manager = getattr(self.unwrapped, "reward_manager", None)
+            if reward_manager is not None:
+                try:
+                    term_names = list(reward_manager.active_terms)
+                    step_rewards = reward_manager._step_reward.detach().clone().cpu()
+                    # capture per-term magnitudes to understand explosions
+                    snapshot["reward_term_max_abs"] = {
+                        term: float(torch.max(torch.abs(step_rewards[:, idx])).item())
+                        for idx, term in enumerate(term_names)
+                    }
+                    sample_count = min(4, step_rewards.shape[0])
+                    term_samples: list[dict[str, float]] = []
+                    for env_idx in range(sample_count):
+                        term_samples.append(
+                            {
+                                term: float(step_rewards[env_idx, term_idx].item())
+                                for term_idx, term in enumerate(term_names)
+                            }
+                        )
+                    snapshot["reward_term_samples"] = term_samples
+                except Exception:
+                    pass
+            log_path = getattr(
+                self, "_reward_monitor_log_path", Path("logs/rsl_rl/reward_monitor_logs.jsonl")
+            )
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(snapshot) + "\n")
+            printable_ts = snapshot.get("timestamp_iso", f"{timestamp:.3f}")
+            reward_span = (snapshot["reward_min"], snapshot["reward_max"])
+            print(
+                "[Reward Monitor] Logged event "
+                f"(#{event_idx}, {reason}) at step {common_step} ({printable_ts}); "
+                f"reward range [{reward_span[0]:.2f}, {reward_span[1]:.2f}]. "
+                f"Snapshot saved to {log_path}."
+            )
+
+        if reward_large:
+            _log_snapshot("magnitude > 1e3")
+        if reward_nan or reward_inf:
+            reason = "NaN" if reward_nan else "Inf"
+            _log_snapshot(reason)
+            raise RuntimeError("Invalid reward detected (see logs above).")
         # compute dones for compatibility with RSL-RL
         dones = (terminated | truncated).to(dtype=torch.long)
         # move extra observations to the extras dict
