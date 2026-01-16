@@ -78,3 +78,16 @@ class ManagerBasedRLEnvCfg(ManagerBasedEnvCfg):
 
     Please refer to the :class:`isaaclab.managers.CommandManager` class for more details.
     """
+
+    state_diagnostics_interval: int | None = 2048
+    """Number of environment steps between automatic state snapshots.
+
+    If set to ``None`` or a non-positive value, periodic diagnostics are disabled (unless explicitly forced).
+    """
+
+    state_diagnostics_height_threshold: float | None = 1.5
+    """Root-height threshold for diagnostics snapshots.
+
+    Diagnostics are skipped when the tallest root height stays below this value. Set to ``None`` to always
+    capture snapshots at the configured interval.
+    """

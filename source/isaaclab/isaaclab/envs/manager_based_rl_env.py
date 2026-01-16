@@ -84,8 +84,17 @@ class ManagerBasedRLEnv(ManagerBasedEnv, gym.Env):
         # -- periodic diagnostics
         self._state_diagnostics_log_path = Path("logs/rsl_rl/state_diagnostics_logs.jsonl")
         self._state_diagnostics_event_counter = 0
-        self._state_diagnostics_interval = 2048
-        self._state_diagnostics_height_threshold = 1.5
+        cfg_interval = getattr(cfg, "state_diagnostics_interval", 2048)
+        env_interval = os.environ.get("ISAACLAB_STATE_DIAGNOSTICS_INTERVAL")
+        if env_interval is not None:
+            cfg_interval = int(env_interval)
+        self._state_diagnostics_interval = cfg_interval if cfg_interval is not None else 0
+        self._state_diagnostics_enabled = self._state_diagnostics_interval > 0
+        cfg_height_thresh = getattr(cfg, "state_diagnostics_height_threshold", 1.5)
+        env_height_thresh = os.environ.get("ISAACLAB_STATE_DIAGNOSTICS_HEIGHT")
+        if env_height_thresh is not None:
+            cfg_height_thresh = float(env_height_thresh)
+        self._state_diagnostics_height_threshold = cfg_height_thresh
         # -- reward monitor placeholder (mirrors vecenv wrapper path)
         self._reward_monitor_log_path = Path("logs/rsl_rl/reward_monitor_logs.jsonl")
         # -- sanitization budget monitoring
@@ -561,12 +570,23 @@ class ManagerBasedRLEnv(ManagerBasedEnv, gym.Env):
         except KeyError:
             return
         if not force:
-            if self.common_step_counter % self._state_diagnostics_interval != 0:
-                # trigger if root height exceeds threshold
-                root_height = robot.data.root_pos_w[:, 2]
-                if torch.max(root_height).item() < self._state_diagnostics_height_threshold:
+            if not self._state_diagnostics_enabled or self._state_diagnostics_interval <= 0:
+                return
+            should_log = False
+            reason_override = reason
+            if self.common_step_counter % self._state_diagnostics_interval == 0:
+                should_log = True
+            elif self._state_diagnostics_height_threshold is not None:
+                root_pos_w = getattr(robot.data, "root_pos_w", None)
+                if root_pos_w is None:
                     return
-                reason = reason or "height_threshold"
+                root_height = root_pos_w[:, 2]
+                if torch.max(root_height).item() >= self._state_diagnostics_height_threshold:
+                    should_log = True
+                    reason_override = reason_override or "height_threshold"
+            if not should_log:
+                return
+            reason = reason_override
         timestamp = time.time()
         self._state_diagnostics_event_counter += 1
         entry: dict[str, Any] = {
