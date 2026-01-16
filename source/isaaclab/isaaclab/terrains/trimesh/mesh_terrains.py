@@ -243,7 +243,12 @@ def inverted_pyramid_stairs_terrain(
     meshes_list.append(box_middle)
     # origin of the terrain
     origin = np.array([terrain_center[0], terrain_center[1], -(num_steps + 1) * step_height])
-
+    z_offset = getattr(cfg, "z_offset", 0.0)
+    if z_offset != 0.0:
+        shift = np.array([0.0, 0.0, z_offset])
+        for mesh in meshes_list:
+            mesh.apply_translation(shift)
+        origin = origin + shift
     return meshes_list, origin
 
 

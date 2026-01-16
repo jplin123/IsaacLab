@@ -64,6 +64,8 @@ class MeshInvertedPyramidStairsTerrainCfg(MeshPyramidStairsTerrainCfg):
     """
 
     function = mesh_terrains.inverted_pyramid_stairs_terrain
+    z_offset: float = 0.0
+    """Additional vertical offset applied to the generated mesh (in m)."""
 
 
 @configclass

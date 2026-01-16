@@ -512,3 +512,35 @@ index cabc6e5824..ce00e31e9d 100644
 +    Diagnostics are skipped when the tallest root height stays below this value. Set to ``None`` to always
 +    capture snapshots at the configured interval.
 +    """
+
+diff --git a/source/isaaclab/isaaclab/terrains/trimesh/mesh_terrains.py b/source/isaaclab/isaaclab/terrains/trimesh/mesh_terrains.py
+index e4ab2ce3ba..f081dcd4ab 100644
+--- a/source/isaaclab/isaaclab/terrains/trimesh/mesh_terrains.py
++++ b/source/isaaclab/isaaclab/terrains/trimesh/mesh_terrains.py
+@@ -243,7 +243,12 @@ def inverted_pyramid_stairs_terrain(
+     meshes_list.append(box_middle)
+     # origin of the terrain
+     origin = np.array([terrain_center[0], terrain_center[1], -(num_steps + 1) * step_height])
+-
++    z_offset = getattr(cfg, "z_offset", 0.0)
++    if z_offset != 0.0:
++        shift = np.array([0.0, 0.0, z_offset])
++        for mesh in meshes_list:
++            mesh.apply_translation(shift)
++        origin = origin + shift
+     return meshes_list, origin
+ 
+ 
+diff --git a/source/isaaclab/isaaclab/terrains/trimesh/mesh_terrains_cfg.py b/source/isaaclab/isaaclab/terrains/trimesh/mesh_terrains_cfg.py
+index 3c4ca81d52..afb857fc19 100644
+--- a/source/isaaclab/isaaclab/terrains/trimesh/mesh_terrains_cfg.py
++++ b/source/isaaclab/isaaclab/terrains/trimesh/mesh_terrains_cfg.py
+@@ -64,6 +64,8 @@ class MeshInvertedPyramidStairsTerrainCfg(MeshPyramidStairsTerrainCfg):
+     """
+ 
+     function = mesh_terrains.inverted_pyramid_stairs_terrain
++    z_offset: float = 0.0
++    """Additional vertical offset applied to the generated mesh (in m)."""
+ 
+ 
+ @configclass
