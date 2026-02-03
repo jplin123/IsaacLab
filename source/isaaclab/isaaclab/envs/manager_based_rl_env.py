@@ -528,7 +528,14 @@ class ManagerBasedRLEnv(ManagerBasedEnv, gym.Env):
                 default_joint = robot.data.default_joint_pos
                 if default_joint.dim() == 1:
                     default_joint = default_joint.unsqueeze(0)
-                default_joint = default_joint.expand(env_count, -1)
+                if default_joint.shape[0] == 1:
+                    default_joint = default_joint.expand(env_count, -1)
+                elif default_joint.shape[0] == env_count:
+                    default_joint = default_joint
+                elif default_joint.shape[0] == robot.data.joint_pos.shape[0]:
+                    default_joint = default_joint[env_ids]
+                else:
+                    default_joint = default_joint[:1].expand(env_count, -1)
                 robot.data.joint_pos[env_ids] = default_joint
             if getattr(robot.data, "joint_vel", None) is not None:
                 robot.data.joint_vel[env_ids] = 0.0

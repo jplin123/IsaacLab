@@ -1027,6 +1027,34 @@ def reset_root_state_from_terrain(
     asset.write_root_velocity_to_sim(velocities, env_ids=env_ids)
 
 
+# Small helper to sanitize env/joint indices for reset operations.
+def _sanitize_reset_joint_inputs(env, env_ids, asset, asset_cfg):
+    # Validate on CPU first to avoid GPU index assertions.
+    env_ids_cpu = env_ids.detach().to(device="cpu", dtype=torch.long).view(-1)
+    if env_ids_cpu.numel() == 0:
+        return env_ids_cpu.to(device=asset.device), asset_cfg.joint_ids
+    max_env = asset.num_instances - 1
+    valid_env = (env_ids_cpu >= 0) & (env_ids_cpu <= max_env)
+    if not valid_env.all():
+        env_ids_cpu = env_ids_cpu[valid_env]
+    if env_ids_cpu.numel() == 0:
+        return env_ids_cpu.to(device=asset.device), asset_cfg.joint_ids
+
+    joint_ids = asset_cfg.joint_ids
+    if isinstance(joint_ids, slice):
+        return env_ids_cpu.to(device=asset.device), joint_ids
+    joint_ids_cpu = torch.as_tensor(joint_ids, device="cpu", dtype=torch.long).view(-1)
+    if joint_ids_cpu.numel() == 0:
+        return env_ids_cpu.to(device=asset.device), joint_ids_cpu.to(device=asset.device)
+    max_joint = asset.num_joints - 1
+    valid_joint = (joint_ids_cpu >= 0) & (joint_ids_cpu <= max_joint)
+    if not valid_joint.all():
+        joint_ids_cpu = joint_ids_cpu[valid_joint]
+    if joint_ids_cpu.numel() == 0:
+        return env_ids_cpu.to(device=asset.device), joint_ids_cpu.to(device=asset.device)
+    return env_ids_cpu.to(device=asset.device), joint_ids_cpu.to(device=asset.device)
+
+
 def reset_joints_by_scale(
     env: ManagerBasedEnv,
     env_ids: torch.Tensor,
@@ -1041,19 +1069,29 @@ def reset_joints_by_scale(
     """
     # extract the used quantities (to enable type-hinting)
     asset: Articulation = env.scene[asset_cfg.name]
+    env_ids, joint_ids = _sanitize_reset_joint_inputs(env, env_ids, asset, asset_cfg)
+    if env_ids.numel() == 0:
+        return
+    if not isinstance(joint_ids, slice) and getattr(joint_ids, 'numel', lambda: 1)() == 0:
+        return
+    if env_ids.numel() == 0:
+        return
+    if not isinstance(joint_ids, slice) and getattr(joint_ids, 'numel', lambda: 1)() == 0:
+        return
     # get default joint state
-    joint_pos = asset.data.default_joint_pos[env_ids, asset_cfg.joint_ids].clone()
-    joint_vel = asset.data.default_joint_vel[env_ids, asset_cfg.joint_ids].clone()
+    joint_pos = asset.data.default_joint_pos[env_ids, joint_ids].clone()
+    joint_vel = asset.data.default_joint_vel[env_ids, joint_ids].clone()
 
     # scale these values randomly
     joint_pos *= math_utils.sample_uniform(*position_range, joint_pos.shape, joint_pos.device)
     joint_vel *= math_utils.sample_uniform(*velocity_range, joint_vel.shape, joint_vel.device)
 
     # clamp joint pos to limits
-    joint_pos_limits = asset.data.soft_joint_pos_limits[env_ids, asset_cfg.joint_ids]
+    joint_pos_limits = asset.data.soft_joint_pos_limits[env_ids, joint_ids]
     joint_pos = joint_pos.clamp_(joint_pos_limits[..., 0], joint_pos_limits[..., 1])
     # clamp joint vel to limits
-    joint_vel_limits = asset.data.soft_joint_vel_limits[env_ids, asset_cfg.joint_ids]
+    joint_vel_limits = asset.data.soft_joint_vel_limits[env_ids, joint_ids]
+    joint_vel_limits = torch.nan_to_num(joint_vel_limits, nan=0.0, posinf=0.0, neginf=0.0).abs()
     joint_vel = joint_vel.clamp_(-joint_vel_limits, joint_vel_limits)
 
     # set into the physics simulation
@@ -1061,7 +1099,7 @@ def reset_joints_by_scale(
         joint_pos.view(len(env_ids), -1),
         joint_vel.view(len(env_ids), -1),
         env_ids=env_ids,
-        joint_ids=asset_cfg.joint_ids,
+        joint_ids=joint_ids,
     )
 
 
@@ -1079,20 +1117,30 @@ def reset_joints_by_offset(
     """
     # extract the used quantities (to enable type-hinting)
     asset: Articulation = env.scene[asset_cfg.name]
+    env_ids, joint_ids = _sanitize_reset_joint_inputs(env, env_ids, asset, asset_cfg)
+    if env_ids.numel() == 0:
+        return
+    if not isinstance(joint_ids, slice) and getattr(joint_ids, 'numel', lambda: 1)() == 0:
+        return
+    if env_ids.numel() == 0:
+        return
+    if not isinstance(joint_ids, slice) and getattr(joint_ids, 'numel', lambda: 1)() == 0:
+        return
 
     # get default joint state
-    joint_pos = asset.data.default_joint_pos[env_ids, asset_cfg.joint_ids].clone()
-    joint_vel = asset.data.default_joint_vel[env_ids, asset_cfg.joint_ids].clone()
+    joint_pos = asset.data.default_joint_pos[env_ids, joint_ids].clone()
+    joint_vel = asset.data.default_joint_vel[env_ids, joint_ids].clone()
 
     # bias these values randomly
     joint_pos += math_utils.sample_uniform(*position_range, joint_pos.shape, joint_pos.device)
     joint_vel += math_utils.sample_uniform(*velocity_range, joint_vel.shape, joint_vel.device)
 
     # clamp joint pos to limits
-    joint_pos_limits = asset.data.soft_joint_pos_limits[env_ids, asset_cfg.joint_ids]
+    joint_pos_limits = asset.data.soft_joint_pos_limits[env_ids, joint_ids]
     joint_pos = joint_pos.clamp_(joint_pos_limits[..., 0], joint_pos_limits[..., 1])
     # clamp joint vel to limits
-    joint_vel_limits = asset.data.soft_joint_vel_limits[env_ids, asset_cfg.joint_ids]
+    joint_vel_limits = asset.data.soft_joint_vel_limits[env_ids, joint_ids]
+    joint_vel_limits = torch.nan_to_num(joint_vel_limits, nan=0.0, posinf=0.0, neginf=0.0).abs()
     joint_vel = joint_vel.clamp_(-joint_vel_limits, joint_vel_limits)
 
     # set into the physics simulation
@@ -1100,7 +1148,7 @@ def reset_joints_by_offset(
         joint_pos.view(len(env_ids), -1),
         joint_vel.view(len(env_ids), -1),
         env_ids=env_ids,
-        joint_ids=asset_cfg.joint_ids,
+        joint_ids=joint_ids,
     )
 
 
