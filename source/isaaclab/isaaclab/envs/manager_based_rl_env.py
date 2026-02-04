@@ -442,31 +442,33 @@ class ManagerBasedRLEnv(ManagerBasedEnv, gym.Env):
         device = robot.data.root_pos_w.device
         invalid_mask = torch.zeros(num_envs, dtype=torch.bool, device=device)
         tensors_to_check = [
-            robot.data.root_pos_w,
-            robot.data.root_quat_w,
-            robot.data.root_lin_vel_w,
-            robot.data.root_ang_vel_w,
-            getattr(robot.data, "joint_pos", None),
-            getattr(robot.data, "joint_vel", None),
-            getattr(robot.data, "joint_acc", None),
-            getattr(robot.data, "body_pos_w", None),
-            getattr(robot.data, "body_quat_w", None),
+            ("root_pos_w", robot.data.root_pos_w),
+            ("root_quat_w", robot.data.root_quat_w),
+            ("root_lin_vel_w", robot.data.root_lin_vel_w),
+            ("root_ang_vel_w", robot.data.root_ang_vel_w),
+            ("joint_pos", getattr(robot.data, "joint_pos", None)),
+            ("joint_vel", getattr(robot.data, "joint_vel", None)),
+            ("joint_acc", getattr(robot.data, "joint_acc", None)),
+            ("body_pos_w", getattr(robot.data, "body_pos_w", None)),
+            ("body_quat_w", getattr(robot.data, "body_quat_w", None)),
         ]
+        invalid_detail: dict[str, dict[str, torch.Tensor]] = {}
+
         def _reduce_env(mask_tensor: torch.Tensor) -> torch.Tensor:
             if mask_tensor.dim() <= 1:
                 return mask_tensor
             dims = tuple(range(1, mask_tensor.dim()))
             return mask_tensor.any(dim=dims)
 
-        for tensor in tensors_to_check:
+        for name, tensor in tensors_to_check:
             if tensor is None:
                 continue
-            nan_mask = torch.isnan(tensor)
-            inf_mask = torch.isinf(tensor)
-            nan_mask = _reduce_env(nan_mask)
-            inf_mask = _reduce_env(inf_mask)
-            invalid_mask |= nan_mask
-            invalid_mask |= inf_mask
+            nan_mask = _reduce_env(torch.isnan(tensor))
+            inf_mask = _reduce_env(torch.isinf(tensor))
+            invalid_env = nan_mask | inf_mask
+            if torch.any(invalid_env):
+                invalid_detail[name] = {"nan": nan_mask, "inf": inf_mask}
+            invalid_mask |= invalid_env
         invalid_any = torch.any(invalid_mask)
         # sanitize all tracked tensors in-place
         tensors_to_sanitize = [
@@ -504,6 +506,51 @@ class ManagerBasedRLEnv(ManagerBasedEnv, gym.Env):
             "sample_env_ids": sample_ids_tensor.tolist(),
             "action": "nan_sanitized",
         }
+        if invalid_detail:
+            invalid_summary = {}
+            invalid_samples = {}
+            for name, masks in invalid_detail.items():
+                nan_env = masks["nan"]
+                inf_env = masks["inf"]
+                invalid_env = nan_env | inf_env
+                invalid_summary[name] = {
+                    "nan_envs": int(nan_env.sum().item()),
+                    "inf_envs": int(inf_env.sum().item()),
+                }
+                sample_ids = torch.nonzero(invalid_env, as_tuple=False).squeeze(-1)[:4]
+                invalid_samples[name] = sample_ids.detach().cpu().tolist()
+            log_entry["invalid_tensors"] = invalid_summary
+            log_entry["invalid_tensor_samples"] = invalid_samples
+            invalid_stats = {}
+            for name, tensor in tensors_to_check:
+                if name not in invalid_detail or tensor is None:
+                    continue
+                mask = invalid_detail[name]["nan"] | invalid_detail[name]["inf"]
+                if not torch.any(mask):
+                    continue
+                # Flatten per-env tensor slices for min/max.
+                env_ids = torch.nonzero(mask, as_tuple=False).squeeze(-1)
+                sample_ids = env_ids[:4]
+                vals = []
+                for env_id in sample_ids.tolist():
+                    try:
+                        v = tensor[env_id]
+                        vals.append(v.reshape(-1))
+                    except Exception:
+                        continue
+                if not vals:
+                    continue
+                flat = torch.cat(vals, dim=0)
+                flat = torch.nan_to_num(flat, nan=0.0, posinf=0.0, neginf=0.0)
+                invalid_stats[name] = {
+                    "sample_env_ids": sample_ids.detach().cpu().tolist(),
+                    "min": float(torch.min(flat).item()),
+                    "max": float(torch.max(flat).item()),
+                    "mean": float(torch.mean(flat).item()),
+                }
+            if invalid_stats:
+                log_entry["invalid_tensor_stats"] = invalid_stats
+
         with torch.no_grad():
             try:
                 commands_tensor = self.command_manager.get_command("base_velocity").detach().cpu()
